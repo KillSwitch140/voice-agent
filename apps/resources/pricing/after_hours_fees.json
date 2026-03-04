@@ -1,0 +1,25 @@
+{
+  "_note": "All prices are illustrative ranges. Actual quotes require on-site diagnosis by a licensed technician.",
+  "business_hours": {
+    "monday_friday": "8:00 AM – 5:00 PM",
+    "saturday": "9:00 AM – 2:00 PM"
+  },
+  "standard_service_call": {
+    "diagnostic_fee_range": "$89 – $129",
+    "description": "Covers technician travel and initial diagnosis. Waived if repair is booked same visit."
+  },
+  "after_hours_surcharge": {
+    "amount_range": "$120 – $180",
+    "applies_when": "Outside standard business hours",
+    "description": "Emergency dispatch surcharge added on top of standard diagnostic fee."
+  },
+  "common_repairs": {
+    "furnace_ignitor_replacement": "$150 – $350",
+    "furnace_heat_exchanger": "$500 – $1,500",
+    "ac_refrigerant_recharge": "$200 – $600",
+    "thermostat_replacement": "$100 – $300",
+    "duct_cleaning_per_vent": "$30 – $60",
+    "annual_maintenance_plan": "$150 – $250 per year"
+  },
+  "disclaimer": "Final pricing depends on parts availability, job complexity, and technician assessment. Only a licensed technician can provide a firm quote after inspection."
+}
