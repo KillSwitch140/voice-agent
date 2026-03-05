@@ -121,7 +121,7 @@ async def _sb_patch(table: str, filter_param: str, filter_val: str, payload: dic
     return {"ok": r.status_code in (200, 204)}
 
 
-async def _upsert_customer(phone: str, name: str, postal_code: str) -> None:
+async def _upsert_customer(phone: str, name: str, city: str) -> None:
     """Insert or update a customer record keyed by phone number."""
     try:
         async with httpx.AsyncClient(timeout=5) as c:
@@ -130,7 +130,7 @@ async def _upsert_customer(phone: str, name: str, postal_code: str) -> None:
                 json={
                     "phone": phone,
                     "name": name,
-                    "postal_code": postal_code,
+                    "city": city,
                     "updated_at": datetime.utcnow().isoformat(),
                 },
                 headers={
@@ -145,7 +145,7 @@ async def _upsert_customer(phone: str, name: str, postal_code: str) -> None:
 # ─── Tools ────────────────────────────────────────────────────────────────────
 
 
-async def get_availability(date_range: str, job_type: str, postal_code: str) -> dict:
+async def get_availability(date_range: str, job_type: str, city: str = "") -> dict:
     """
     Return available booking slots for the given date range.
 
@@ -195,7 +195,7 @@ async def get_availability(date_range: str, job_type: str, postal_code: str) -> 
 async def create_booking(
     customer_name: str,
     phone: str,
-    postal_code: str,
+    city: str,
     issue_description: str,
     preferred_date: str,
     preferred_time: str,
@@ -240,7 +240,7 @@ async def create_booking(
     pricing_tier = "surge" if _is_slot_surge(preferred_date, preferred_time) else "standard"
 
     # 4. Upsert customer
-    await _upsert_customer(phone, customer_name, postal_code)
+    await _upsert_customer(phone, customer_name, city)
 
     # 5. Create booking row
     booking_id = f"bk_{uuid.uuid4().hex[:12]}"
@@ -249,7 +249,7 @@ async def create_booking(
         "call_id": call_id or None,
         "customer_name": customer_name,
         "phone": phone,
-        "postal_code": postal_code,
+        "city": city,
         "issue_description": issue_description,
         "preferred_date": preferred_date,
         "preferred_time_slot": preferred_time,

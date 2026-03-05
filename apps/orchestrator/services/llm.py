@@ -29,100 +29,153 @@ _PRICING_RESOURCE = Path(__file__).parents[3] / "apps" / "resources" / "pricing"
 # ─── System prompt ────────────────────────────────────────────────────────────
 
 def _build_system_prompt() -> str:
-    try:
-        pricing = _PRICING_RESOURCE.read_text()
-    except FileNotFoundError:
-        pricing = "{}"
-
     today_str = date.today().isoformat()
     max_date_str = (date.today() + timedelta(days=30)).isoformat()
 
-    return f"""You are Alex, an AI receptionist for Toronto HVAC Services.
+    return f"""You are a data extraction engine for Toronto HVAC Services.
+Your ONLY job is to extract structured data from caller utterances. Python code handles all spoken responses — do NOT generate conversational text.
 
-CONSTRAINTS (enforced — never break these):
-- Voice call: keep every response to 1–2 short sentences.
-- Ask exactly one question at a time.
-- NEVER give an exact repair price. Only cite ranges from the price guide below.
-- NEVER provide gas leak troubleshooting, DIY repair, or unsafe guidance.
+EMERGENCY DETECTION (critical):
+- Set is_emergency=true ONLY for explicit mentions of: gas smell, gas leak, carbon monoxide, CO detector, fire, smoke from furnace, explosion, cannot breathe.
+- A broken furnace, no heat, or stopped heating is NOT an emergency.
 
-EMERGENCY RULE (very strict):
-- Set is_emergency=true ONLY if the caller explicitly mentions: gas smell, gas leak, carbon monoxide, CO detector, fire, smoke from furnace, explosion, or cannot breathe.
-- A broken furnace, no heat, or stopped heating system is NOT an emergency — it is a normal repair booking.
-- When in doubt, do NOT set is_emergency=true. The backend has its own keyword detection for real emergencies.
+ESCALATION DETECTION:
+- Set intent=escalate ONLY when the caller explicitly asks to speak to a person, agent, or human.
+- Words like "wrong", "no", "cancel", "that's not right" are corrections — NOT escalation.
 
-CAPABILITIES:
-- Book new appointments (intent: new_booking), reschedule (intent: reschedule), or cancel (intent: cancellation) existing bookings.
-- Answer pricing questions (intent: pricing) using ranges from the price guide only.
-- If the caller asks to speak to a person, agent, or human, or you cannot resolve their issue, set intent=escalate. Say "I'll have someone from our team call you right back." Do not ask for anything further.
+DATE EXTRACTION:
+- Today is {today_str}. Maximum booking date: {max_date_str}.
+- When a caller gives a month+day without a year, always resolve to the nearest upcoming date (e.g. "sixth March" when today is {today_str} → {today_str[:4]}-03-06).
+- Do NOT reject or validate dates — just extract what the caller said in YYYY-MM-DD format.
+- preferred_time must exactly match the slot format shown in [Available slots] (e.g. "10:00-12:00").
 
-BOOKING DATE RULES (strictly enforced by the backend):
-- Today is {today_str}. Only accept future dates. Maximum booking date: {max_date_str} (30 days out).
-- If the caller requests a past date or wants to modify a past appointment: say "I'm sorry, I can't make changes to past appointments — I'll connect you with a team member." then set intent=escalate.
-- If the caller requests a date beyond {max_date_str}: say "I can only book up to 30 days in advance. Could you pick a date before {max_date_str}?"
-- preferred_date must be in YYYY-MM-DD format. preferred_time must match a slot format like "10:00-12:00".
+SLOT ACCEPTANCE (collecting_booking_details only):
+- Extract preferred_date and preferred_time ONLY when the caller explicitly accepts or names a specific slot.
+- If the caller says "no", "doesn't work", "different day", or similar — do NOT extract preferred_date or preferred_time.
 
-SLOT PRICING:
-- STANDARD rate slots: Mon–Fri 8am–4pm, Sat 9am–1pm. Diagnostic fee $89–$129.
-- SURGE rate slots (after-hours): evenings, Sat afternoons, Sundays. Standard fee + $120–$180 surcharge.
-- When presenting available slots from the [Available slots] list below, mention whether each is standard or surge rate so the caller can choose.
-- Extract the caller's chosen date/time into preferred_date and preferred_time exactly as shown in the available slots list.
-
-FLOW GUIDANCE BY STATE:
-- pricing: Answer the price question using ranges from the guide. Then offer: "Would you also like to schedule a service call?"
-- pricing_followup: If caller wants to book → set intent=new_booking. If no → set intent=unknown.
-- out_of_area: Say "I'm sorry, we don't currently service [postal_code]. I'm sending you a helpful SMS. Thank you for calling — have a great day!" Do not offer workarounds.
-- collecting_booking_ref: Ask for their booking reference number (format: bk_...). Extract it to booking_id.
-- collecting_booking_details: Present available slots from the [Available slots] list. Tell caller if a slot is standard or surge rate. Ask which slot they prefer.
-- collecting_booking_details (reschedule): Only ask for a new preferred date and time — do not re-ask for issue_description.
-- after_hours_disclosure: The caller chose a SURGE rate slot. Say: "Your selected slot on [date] at [time] is outside standard hours. An after-hours surcharge of $120–$180 applies on top of the standard fee. Would you like to proceed?" Set after_hours_accepted=true or false.
-- confirming_booking (new_booking/reschedule): When caller confirms, set confirmed=true. Say: "Perfect, you're all set! We'll see you on [date] at [time]. Have a great day!"
-- confirming_booking (cancellation): Ask "Just to confirm — you'd like to cancel your booking. Is that correct?" Set confirmed=true only if caller clearly says yes. On confirm say: "Done — your booking is cancelled. Have a great day!"
-
-PRICE GUIDE (ranges only — no firm quotes):
-{pricing}
-
-RESPONSE FORMAT:
-You must always return a JSON object with this schema:
+OUTPUT FORMAT (JSON only, no prose):
 {{
   "intent": "new_booking|reschedule|cancellation|pricing|emergency|escalate|general|unknown|null",
   "is_emergency": false,
   "extracted_slots": {{
-    "postal_code": null,
+    "city": null,
     "customer_name": null,
     "issue_description": null,
     "preferred_date": null,
     "preferred_time": null,
     "booking_id": null,
     "confirmed": null,
-    "after_hours_accepted": null
+    "after_hours_accepted": null,
+    "more_help": null
   }},
-  "response_text": "<what to say to the caller>"
+  "response_text": ""
 }}
-"""
+
+Only include fields you are confident about. Set response_text to empty string."""
+
+
+# Extraction-only hints injected per state.
+# These guide WHAT TO EXTRACT — not what to say. Python generates all spoken responses.
+_STATE_GUIDANCE: dict[str, str] = {
+    "collecting_customer_info": "Extract the caller's name into customer_name.",
+    "collecting_city": "Extract the caller's city into city.",
+    "intent_detection": (
+        "Classify the caller's intent from their utterance.\n"
+        "- new_booking: any mention of booking, appointment, service call, schedule, new service, fix, repair, maintenance.\n"
+        "- reschedule: change, move, reschedule an existing appointment.\n"
+        "- cancellation: cancel an existing appointment.\n"
+        "- pricing: asking about cost, price, rates, fees, how much.\n"
+        "- unknown: ONLY if the utterance is truly ambiguous and matches none of the above.\n"
+        "Do not extract any other slots in this state."
+    ),
+    "pricing": "Set intent=pricing. No slots to extract.",
+    "pricing_followup": (
+        "If caller says yes/sure/want to book: set intent=new_booking. "
+        "If caller says no/that's all/not right now: set intent=unknown."
+    ),
+    "collecting_booking_ref": (
+        "Extract the booking reference number into booking_id. "
+        "Format: bk_ followed by alphanumeric characters."
+    ),
+    "collecting_booking_details": (
+        "Extract issue_description from any problem description.\n"
+        "Extract preferred_date (YYYY-MM-DD) and preferred_time (e.g. '10:00-12:00') "
+        "ONLY when the caller explicitly accepts or names a specific slot from [Available slots]. "
+        "Do NOT extract date/time if caller says no, doesn't work, different day, or similar."
+    ),
+    "collecting_booking_details_reschedule": (
+        "Extract preferred_date and preferred_time ONLY when caller accepts a slot. "
+        "Do not re-extract issue_description."
+    ),
+    "after_hours_disclosure": (
+        "Set after_hours_accepted=true if caller agrees to proceed. "
+        "Set after_hours_accepted=false if caller declines."
+    ),
+    "confirming_booking": (
+        "Set confirmed=true ONLY for explicit yes/correct/go ahead/sure. "
+        "Do NOT set confirmed=true for 'thanks', 'okay', 'cool', or filler words. "
+        "Set confirmed=false if caller says no/cancel/different."
+    ),
+    "wrap_up": (
+        "Set more_help=true if caller wants more help. "
+        "Set more_help=false if caller is done (no/that's all/goodbye). "
+        "You MUST set one or the other — never leave more_help null when the caller has responded."
+    ),
+}
+
+
+def _fmt_date(date_str: str) -> str:
+    """'2026-03-05' → 'March 5th'"""
+    from datetime import datetime as _dt
+    d = _dt.strptime(date_str, "%Y-%m-%d")
+    day = d.day
+    suffix = "th" if 11 <= day <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(day % 10, "th")
+    return f"{d.strftime('%B')} {day}{suffix}"
+
+
+def _fmt_time(time_str: str) -> str:
+    """'10:00-12:00' → '10:00 AM to 12:00 PM'"""
+    try:
+        start, end = time_str.split("-")
+        def _t(s: str) -> str:
+            h, m = map(int, s.split(":"))
+            ampm = "AM" if h < 12 else "PM"
+            return f"{h % 12 or 12}:{m:02d} {ampm}"
+        return f"{_t(start)} to {_t(end)}"
+    except Exception:
+        return time_str
 
 
 def _build_context_messages(session: CallSession, utterance: str) -> list[dict]:
     messages: list[dict] = [{"role": "system", "content": _build_system_prompt()}]
 
-    # Compact state context (not full transcript — keeps tokens low)
+    # Inject only the guidance for the current state so the LLM cannot apply logic
+    # from other states (e.g. generating an out_of_area message while in collecting_city).
+    state_key = session.state.value
+    if (session.state.value == "collecting_booking_details"
+            and session.intent and session.intent.value == "reschedule"):
+        state_key = "collecting_booking_details_reschedule"
+    guidance = _STATE_GUIDANCE.get(state_key, "")
+
     state_ctx = (
         f"[State: {session.state.value} | Intent: {session.intent} | "
         f"Emergency: {session.is_emergency} | "
         f"Slots collected: {session.slots.model_dump(exclude_none=True)} | "
-        f"Missing slots: {get_missing_slots(session)}]"
+        f"Missing slots: {get_missing_slots(session)}]\n"
+        + (f"[Your instructions for this turn: {guidance}]" if guidance else "")
     )
     messages.append({"role": "system", "content": state_ctx})
 
-    # Inject available slots if fetched (when collecting booking details)
+    # Inject available slots if fetched (when collecting booking details).
+    # Rate labels are intentionally omitted — the backend discloses pricing at confirmation.
     if session.available_slots:
-        lines = []
-        for s in session.available_slots[:12]:
-            tier = s.get("pricing_tier", "standard")
-            label = "STANDARD rate" if tier == "standard" else "SURGE rate (after-hours surcharge)"
-            lines.append(f"  {s['date']} {s['time_slot']} — {label}")
+        lines = [
+            f"  {_fmt_date(s['date'])}, {_fmt_time(s['time_slot'])}"
+            for s in session.available_slots[:12]
+        ]
         messages.append({
             "role": "system",
-            "content": "[Available slots — present these options to the caller:\n" + "\n".join(lines) + "]",
+            "content": "[Available slots — offer ONE at a time, starting with the first:\n" + "\n".join(lines) + "]",
         })
 
     # Rolling last-5 turns
@@ -158,6 +211,7 @@ async def run_turn(
     )
 
     raw = response.choices[0].message.content or "{}"
+    logger.info("LLM raw [%s]: %s", session.state.value, raw)
     try:
         data: dict = json.loads(raw)
     except json.JSONDecodeError:

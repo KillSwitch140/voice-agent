@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     twilio_auth_token: str = ""
     twilio_phone_number: str = ""
 
+    # WebRTC test client (optional — only needed for /voice/test-client)
+    twilio_api_key_sid: str = ""
+    twilio_api_key_secret: str = ""
+    twilio_twiml_app_sid: str = ""
+
     deepgram_api_key: str = ""
     openai_api_key: str = ""
 

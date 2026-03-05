@@ -2,7 +2,6 @@
 ## Deploy via: render.com → New → Blueprint → point to this repo.
 
 services:
-  # ── Orchestrator ─────────────────────────────────────────────────────────
   - type: web
     name: hvac-orchestrator
     runtime: python
@@ -31,42 +30,7 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
-      - key: ELEVENLABS_API_KEY
-        sync: false
-      - key: ELEVENLABS_VOICE_ID
-        sync: false
       - key: SUPABASE_URL
         sync: false
       - key: SUPABASE_SERVICE_KEY
-        sync: false
-      - key: MCP_SERVER_URL
-        fromService:
-          name: hvac-mcp-server
-          type: web
-          property: host
-          # Will be set as https://hvac-mcp-server.onrender.com
-
-  # ── MCP Server ───────────────────────────────────────────────────────────
-  - type: web
-    name: hvac-mcp-server
-    runtime: python
-    region: ohio
-    plan: starter
-    buildCommand: pip install -r apps/mcp_server/requirements.txt
-    startCommand: >
-      python -m apps.mcp_server.main
-    envVars:
-      - key: PYTHONPATH
-        value: /opt/render/project/src
-      - key: ENVIRONMENT
-        value: production
-      - key: SUPABASE_URL
-        sync: false
-      - key: SUPABASE_SERVICE_KEY
-        sync: false
-      - key: TWILIO_ACCOUNT_SID
-        sync: false
-      - key: TWILIO_AUTH_TOKEN
-        sync: false
-      - key: TWILIO_PHONE_NUMBER
         sync: false

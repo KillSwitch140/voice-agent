@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HVAC Agent — Voice Test Client</title>
+  <!-- Twilio Voice SDK 2.x — unpkg mirrors npm directly, no version guessing -->
+  <script src="https://unpkg.com/@twilio/voice-sdk@2/dist/twilio.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      background: #0d1117;
+      color: #c9d1d9;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem 1rem;
+    }
+
+    header { text-align: center; margin-bottom: 2rem; }
+    header h1 { font-size: 1.25rem; font-weight: 600; color: #f0f6fc; }
+    header p  { font-size: 0.78rem; color: #8b949e; margin-top: 0.25rem; }
+
+    .card {
+      background: #161b22;
+      border: 1px solid #30363d;
+      border-radius: 12px;
+      padding: 1.25rem;
+      width: 100%;
+      max-width: 520px;
+      margin-bottom: 1rem;
+    }
+
+    .card-title {
+      font-size: 0.68rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #8b949e;
+      margin-bottom: 0.9rem;
+    }
+
+    /* ── Status bar ── */
+    .status-bar { display: flex; align-items: center; gap: 0.6rem; margin-bottom: 1.1rem; }
+    .dot {
+      width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+      background: #30363d;
+    }
+    .dot.idle        { background: #30363d; }
+    .dot.ready       { background: #3fb950; }
+    .dot.connecting  { background: #d29922; animation: blink 0.9s ease-in-out infinite; }
+    .dot.connected   { background: #58a6ff; animation: blink 1.4s ease-in-out infinite; }
+    .dot.ended       { background: #f85149; }
+    @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+    #status-text { font-size: 0.85rem; color: #8b949e; }
+
+    /* ── Phone number input ── */
+    .field-label { font-size: 0.73rem; color: #8b949e; margin-bottom: 0.35rem; display: block; }
+    .field-row   { display: flex; gap: 0.5rem; margin-bottom: 1.1rem; }
+    .field-row input {
+      flex: 1;
+      background: #0d1117;
+      border: 1px solid #30363d;
+      border-radius: 7px;
+      padding: 0.45rem 0.75rem;
+      color: #c9d1d9;
+      font-size: 0.85rem;
+      outline: none;
+    }
+    .field-row input:focus { border-color: #58a6ff; }
+    .field-row input::placeholder { color: #484f58; }
+
+    /* ── Call button ── */
+    #call-btn {
+      width: 100%;
+      padding: 0.85rem;
+      border: none;
+      border-radius: 9px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s, opacity 0.15s;
+    }
+    #call-btn.call  { background: #238636; color: #fff; }
+    #call-btn.call:hover  { background: #2ea043; }
+    #call-btn.hangup { background: #da3633; color: #fff; }
+    #call-btn.hangup:hover { background: #f85149; }
+    #call-btn:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+
+    /* ── Agent state ── */
+    .kv { display: grid; grid-template-columns: 90px 1fr; gap: 0.3rem 0.75rem; font-size: 0.82rem; }
+    .kv-label { color: #8b949e; line-height: 1.5; }
+    .kv-value { color: #c9d1d9; font-family: ui-monospace, monospace; line-height: 1.5; }
+    .kv-value.blue { color: #79c0ff; }
+    .kv-value.green { color: #56d364; }
+
+    .slots-box {
+      margin-top: 0.75rem;
+      background: #0d1117;
+      border-radius: 6px;
+      padding: 0.55rem 0.75rem;
+      font-size: 0.76rem;
+      font-family: ui-monospace, monospace;
+      color: #a5d6a7;
+      min-height: 2.5rem;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    /* ── Conversation log ── */
+    #log {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      max-height: 320px;
+      overflow-y: auto;
+      scroll-behavior: smooth;
+    }
+    #log:empty::after {
+      content: "Conversation will appear here once the call connects…";
+      color: #484f58;
+      font-size: 0.8rem;
+      font-style: italic;
+    }
+    .turn {
+      padding: 0.5rem 0.7rem;
+      border-radius: 8px;
+      font-size: 0.83rem;
+      line-height: 1.45;
+    }
+    .turn-role { font-size: 0.67rem; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.55; margin-bottom: 0.2rem; }
+    .turn.user      { background: #1c2d3f; border-left: 3px solid #58a6ff; }
+    .turn.user .turn-role { color: #79c0ff; }
+    .turn.assistant { background: #1a2c1a; border-left: 3px solid #3fb950; }
+    .turn.assistant .turn-role { color: #56d364; }
+
+    /* ── Error banner ── */
+    #error-banner {
+      display: none;
+      background: #2d1f1f;
+      border: 1px solid #6e2121;
+      border-radius: 8px;
+      padding: 0.6rem 0.9rem;
+      font-size: 0.8rem;
+      color: #f85149;
+      margin-bottom: 1rem;
+      width: 100%;
+      max-width: 520px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Toronto HVAC — Voice Test Client</h1>
+    <p>Browser WebRTC call &rarr; Twilio &rarr; AI receptionist (real audio, real conversation)</p>
+  </header>
+
+  <div id="error-banner"></div>
+
+  <!-- Controls -->
+  <div class="card">
+    <div class="status-bar">
+      <div class="dot idle" id="dot"></div>
+      <span id="status-text">Initialising…</span>
+    </div>
+
+    <label class="field-label" for="phone-input">
+      Your phone number <span style="color:#484f58">(optional — only needed if you want SMS confirmations)</span>
+    </label>
+    <div class="field-row">
+      <input type="tel" id="phone-input" placeholder="+14165551234" autocomplete="tel" />
+    </div>
+
+    <button id="call-btn" class="call" disabled onclick="toggleCall()">
+      📞 &nbsp;Call Agent
+    </button>
+  </div>
+
+  <!-- Live agent state -->
+  <div class="card">
+    <div class="card-title">Agent State</div>
+    <div class="kv">
+      <span class="kv-label">State</span>
+      <span class="kv-value blue" id="s-state">—</span>
+      <span class="kv-label">Intent</span>
+      <span class="kv-value" id="s-intent">—</span>
+      <span class="kv-label">Turns</span>
+      <span class="kv-value" id="s-turns">—</span>
+      <span class="kv-label">Emergency</span>
+      <span class="kv-value" id="s-emerg">—</span>
+    </div>
+    <div class="slots-box" id="s-slots">—</div>
+  </div>
+
+  <!-- Conversation transcript -->
+  <div class="card">
+    <div class="card-title">Conversation</div>
+    <div id="log"></div>
+  </div>
+
+  <script>
+    // SDK 2.x — new Twilio.Device(token), async device.connect()
+    let device     = null;
+    let activeCall = null;
+    let pollTimer  = null;
+    let knownTurns = 0;
+
+    // ── Init ──────────────────────────────────────────────────────────────────
+
+    async function init() {
+      setStatus('connecting', 'Requesting microphone access…');
+
+      // 1. Microphone permission
+      try {
+        await navigator.mediaDevices.getUserMedia({ audio: true });
+      } catch (e) {
+        showError('Microphone access denied. Allow mic in your browser settings and refresh.');
+        setStatus('ended', 'Microphone blocked');
+        return;
+      }
+
+      // 2. Access token
+      setStatus('connecting', 'Fetching access token…');
+      let token;
+      try {
+        const res  = await fetch('/voice/token');
+        const data = await res.json();
+        if (data.error) { showError(data.error); setStatus('ended', 'Config error'); return; }
+        token = data.token;
+      } catch (e) {
+        showError('Could not reach /voice/token: ' + e.message);
+        setStatus('ended', 'Server unreachable');
+        return;
+      }
+
+      // 3. Create device — SDK 2.x is ready for outgoing calls immediately after construction
+      try {
+        device = new Twilio.Device(token, { logLevel: 'warn' });
+      } catch (e) {
+        showError('Failed to create Twilio Device: ' + e.message);
+        setStatus('ended', 'SDK error');
+        return;
+      }
+
+      device.on('error', (err) => {
+        showError('Twilio error [' + err.code + ']: ' + err.message);
+        setStatus('ended', 'Device error');
+        setBtnCall();
+        stopPolling();
+        activeCall = null;
+      });
+
+      setStatus('ready', 'Ready — click "Call Agent" to start');
+      document.getElementById('call-btn').disabled = false;
+    }
+
+    // ── Call control ──────────────────────────────────────────────────────────
+
+    function toggleCall() {
+      if (activeCall) {
+        activeCall.disconnect();
+      } else {
+        startCall();
+      }
+    }
+
+    async function startCall() {
+      if (!device) return;
+      setBtnDisabled();
+      setStatus('connecting', 'Dialling agent…');
+      clearLog();
+
+      const phone  = document.getElementById('phone-input').value.trim();
+      const params = phone ? { PhoneNumber: phone } : {};
+
+      try {
+        activeCall = await device.connect({ params });
+      } catch (e) {
+        showError('device.connect() failed: ' + e.message);
+        setStatus('ready', 'Failed to connect');
+        setBtnCall();
+        activeCall = null;
+        return;
+      }
+
+      activeCall.on('accept', () => {
+        setStatus('connected', 'Live — speak now');
+        setBtnHangup();
+        const sid = activeCall.parameters.CallSid;
+        if (sid) startPolling(sid);
+      });
+
+      activeCall.on('disconnect', () => {
+        setStatus('ready', 'Call ended — ready for another call');
+        setBtnCall();
+        stopPolling();
+        activeCall = null;
+      });
+
+      activeCall.on('error', (err) => {
+        showError('Call error [' + err.code + ']: ' + err.message);
+        setStatus('ready', 'Call error');
+        setBtnCall();
+        stopPolling();
+        activeCall = null;
+      });
+    }
+
+    // ── Session polling ───────────────────────────────────────────────────────
+
+    function startPolling(callSid) {
+      knownTurns = 0;
+      pollTimer  = setInterval(() => fetchSession(callSid), 1500);
+    }
+
+    function stopPolling() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    async function fetchSession(callSid) {
+      try {
+        const res = await fetch('/voice/session-info/' + callSid);
+        if (!res.ok) return;
+        const d = await res.json();
+        if (d.error) return;
+
+        set('s-state',  d.state  || '—');
+        set('s-intent', d.intent || '—');
+        set('s-emerg',  d.is_emergency ? 'YES' : 'no');
+        set('s-turns',  d.turns ? d.turns.length : '—');
+        document.getElementById('s-slots').textContent =
+          (d.slots && Object.keys(d.slots).length) ? JSON.stringify(d.slots, null, 2) : '—';
+
+        if (d.turns) {
+          d.turns.slice(knownTurns).forEach(t => appendTurn(t.role, t.content));
+          knownTurns = d.turns.length;
+        }
+
+        if (d.state === 'ended') stopPolling();
+      } catch (_) {}
+    }
+
+    // ── UI helpers ────────────────────────────────────────────────────────────
+
+    function setStatus(state, text) {
+      document.getElementById('dot').className = 'dot ' + state;
+      document.getElementById('status-text').textContent = text;
+    }
+
+    function setBtnCall() {
+      const b = document.getElementById('call-btn');
+      b.disabled = false; b.className = 'call';
+      b.innerHTML = '&#128222;&nbsp; Call Agent';
+    }
+
+    function setBtnHangup() {
+      const b = document.getElementById('call-btn');
+      b.disabled = false; b.className = 'hangup';
+      b.innerHTML = '&#9209;&nbsp; Hang Up';
+    }
+
+    function setBtnDisabled() {
+      const b = document.getElementById('call-btn');
+      b.disabled = true; b.innerHTML = 'Connecting…';
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('error-banner');
+      el.textContent = msg; el.style.display = 'block';
+    }
+
+    function set(id, val) { document.getElementById(id).textContent = val; }
+
+    function appendTurn(role, content) {
+      const log = document.getElementById('log');
+      const div = document.createElement('div');
+      div.className = 'turn ' + role;
+      div.innerHTML = '<div class="turn-role">' + esc(role) + '</div>' + esc(content);
+      log.appendChild(div);
+      log.scrollTop = log.scrollHeight;
+    }
+
+    function clearLog() {
+      document.getElementById('log').innerHTML = '';
+      knownTurns = 0;
+      ['s-state','s-intent','s-turns','s-emerg'].forEach(id => set(id, '—'));
+      document.getElementById('s-slots').textContent = '—';
+    }
+
+    function esc(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    window.addEventListener('load', init);
+  </script>
+</body>
+</html>

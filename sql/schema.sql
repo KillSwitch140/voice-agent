@@ -44,7 +44,7 @@ create table if not exists customers (
     name        text,
     email       text,
     address     text,
-    postal_code text,
+    city        text,
     created_at  timestamptz not null default now(),
     updated_at  timestamptz
 );
@@ -56,7 +56,7 @@ create table if not exists bookings (
     call_id              text references calls(id),
     customer_name        text,
     phone                text,
-    postal_code          text,
+    city                 text,
     issue_description    text,
     preferred_date       date,
     preferred_time_slot  text,                 -- e.g. "10:00-12:00"
@@ -112,12 +112,12 @@ create index if not exists idx_rag_embedding
 -- These represent existing bookings so the conflict-check and availability
 -- fetch can be exercised.  Run once; ON CONFLICT DO NOTHING is safe to re-run.
 insert into bookings (
-    id, customer_name, phone, postal_code, issue_description,
+    id, customer_name, phone, city, issue_description,
     preferred_date, preferred_time_slot, priority, status, pricing_tier, created_at
 ) values
-    ('bk_test001', 'Michael Chen',   '+14165550101', 'M5V 2K3', 'Furnace not heating',    '2026-03-05', '10:00-12:00', 'normal', 'confirmed', 'standard', now()),
-    ('bk_test002', 'Sarah Williams', '+14165550102', 'M6K 1A1', 'AC unit noise',           '2026-03-05', '14:00-16:00', 'normal', 'confirmed', 'standard', now()),
-    ('bk_test003', 'David Patel',    '+14165550103', 'M4B 1B3', 'Annual maintenance',      '2026-03-06', '09:00-11:00', 'normal', 'confirmed', 'standard', now()),
-    ('bk_test004', 'Jennifer Kim',   '+14165550104', 'M2N 6A1', 'Thermostat replacement',  '2026-03-07', '10:00-12:00', 'normal', 'confirmed', 'standard', now()),
-    ('bk_test005', 'Robert Singh',   '+14165550105', 'M3M 1N6', 'Emergency furnace repair','2026-03-05', '18:00-20:00', 'urgent', 'confirmed', 'surge',    now())
+    ('bk_test001', 'Michael Chen',   '+14165550101', 'Toronto',    'Furnace not heating',    '2026-03-05', '10:00-12:00', 'normal', 'confirmed', 'standard', now()),
+    ('bk_test002', 'Sarah Williams', '+14165550102', 'Toronto',    'AC unit noise',           '2026-03-05', '14:00-16:00', 'normal', 'confirmed', 'standard', now()),
+    ('bk_test003', 'David Patel',    '+14165550103', 'Scarborough','Annual maintenance',      '2026-03-06', '09:00-11:00', 'normal', 'confirmed', 'standard', now()),
+    ('bk_test004', 'Jennifer Kim',   '+14165550104', 'North York', 'Thermostat replacement',  '2026-03-07', '10:00-12:00', 'normal', 'confirmed', 'standard', now()),
+    ('bk_test005', 'Robert Singh',   '+14165550105', 'Brampton',   'Emergency furnace repair','2026-03-05', '18:00-20:00', 'urgent', 'confirmed', 'surge',    now())
 on conflict do nothing;

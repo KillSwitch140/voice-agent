@@ -1,0 +1,13 @@
+{
+  "_note": "GTA cities serviced by Toronto HVAC Services.",
+  "cities": [
+    "Toronto", "North York", "Scarborough", "Etobicoke", "East York", "York",
+    "Mississauga", "Brampton", "Caledon",
+    "Vaughan", "Markham", "Richmond Hill", "Newmarket", "Aurora",
+    "King", "King City", "East Gwillimbury", "Georgina", "Stouffville",
+    "Whitchurch-Stouffville",
+    "Ajax", "Whitby", "Oshawa", "Pickering", "Uxbridge", "Clarington", "Bowmanville",
+    "Oakville", "Burlington", "Halton Hills", "Georgetown", "Milton"
+  ],
+  "out_of_area_message": "I'm sorry, we don't currently service [city] — we cover cities in the Greater Toronto Area. Is there anything else I can help you with today?"
+}

@@ -2,7 +2,12 @@
 Deepgram live transcription handler.
 
 Wraps the Deepgram Python SDK v3 async live client.
-Receives raw mulaw 8kHz audio from Twilio and emits final transcripts.
+Receives raw mulaw 8kHz audio from Twilio and emits complete utterances.
+
+Uses interim_results=True + utterance_end_ms so that short mid-sentence
+pauses don't prematurely fire the pipeline.  Final transcript segments are
+accumulated until Deepgram fires UtteranceEnd (1.5 s of silence), then the
+full accumulated text is emitted as a single callback.
 """
 from __future__ import annotations
 
@@ -36,6 +41,7 @@ class DeepgramSTT:
         self._client = DeepgramClient(api_key)
         self._connection = None
         self._on_transcript: TranscriptCallback | None = None
+        self._segments: list[str] = []   # accumulated final segments for current utterance
 
     async def start(self, on_transcript: TranscriptCallback) -> None:
         self._on_transcript = on_transcript
@@ -44,14 +50,23 @@ class DeepgramSTT:
         async def _on_message(_, result, **__):
             transcript = result.channel.alternatives[0].transcript
             if result.is_final and transcript.strip():
-                logger.debug("Deepgram final: %s", transcript)
+                self._segments.append(transcript.strip())
+                logger.debug("Deepgram segment: %s", transcript)
+
+        async def _on_utterance_end(_, utterance_end, **__):
+            """Fire the pipeline once Deepgram detects 1.5 s of silence."""
+            if self._segments:
+                full_text = " ".join(self._segments)
+                self._segments.clear()
+                logger.debug("Deepgram utterance complete: %s", full_text)
                 if self._on_transcript:
-                    await self._on_transcript(transcript)
+                    await self._on_transcript(full_text)
 
         async def _on_error(_, error, **__):
             logger.error("Deepgram error: %s", error)
 
         self._connection.on(LiveTranscriptionEvents.Transcript, _on_message)
+        self._connection.on(LiveTranscriptionEvents.UtteranceEnd, _on_utterance_end)
         self._connection.on(LiveTranscriptionEvents.Error, _on_error)
 
         options = LiveOptions(
@@ -61,16 +76,16 @@ class DeepgramSTT:
             sample_rate=8000,
             channels=1,
             punctuate=True,
-            interim_results=False,
-            endpointing=400,   # declare end-of-utterance after 400ms silence
-            utterance_end_ms="1000",
+            interim_results=True,       # required for utterance_end_ms
+            utterance_end_ms="1500",    # fire UtteranceEnd after 1.5 s silence
+            endpointing=300,            # still break long speech into segments
         )
 
         started = await self._connection.start(options)
         if not started:
             raise RuntimeError("Failed to start Deepgram live transcription")
 
-        logger.info("Deepgram STT started")
+        logger.info("Deepgram STT started (utterance_end_ms=1500)")
 
     async def send(self, audio_bytes: bytes) -> None:
         if self._connection:
@@ -78,6 +93,7 @@ class DeepgramSTT:
 
     async def close(self) -> None:
         if self._connection:
+            self._segments.clear()
             await self._connection.finish()
             self._connection = None
             logger.info("Deepgram STT closed")

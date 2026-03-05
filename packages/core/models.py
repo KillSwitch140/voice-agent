@@ -9,19 +9,20 @@ from pydantic import BaseModel, Field
 
 class CallState(str, Enum):
     GREETING = "greeting"
-    INTENT_DETECTION = "intent_detection"
-    COLLECTING_POSTAL = "collecting_postal"
+    COLLECTING_CITY = "collecting_city"
     COLLECTING_BOOKING_REF = "collecting_booking_ref"   # reschedule / cancel
     OUT_OF_AREA = "out_of_area"
     COLLECTING_CUSTOMER_INFO = "collecting_customer_info"
     COLLECTING_BOOKING_DETAILS = "collecting_booking_details"
     AFTER_HOURS_DISCLOSURE = "after_hours_disclosure"   # after-hours surcharge warning
     CONFIRMING_BOOKING = "confirming_booking"
+    INTENT_DETECTION = "intent_detection"
     EMERGENCY_TRIAGE = "emergency_triage"
     PRICING = "pricing"
     PRICING_FOLLOWUP = "pricing_followup"    # offer booking after answering price question
     ESCALATING = "escalating"
     CLOSING = "closing"
+    WRAP_UP = "wrap_up"                                  # "anything else?" gate
     ENDED = "ended"
 
 
@@ -45,7 +46,7 @@ class Priority(str, Enum):
 class CallSlots(BaseModel):
     """Slot-filling container for a single call."""
 
-    postal_code: Optional[str] = None
+    city: Optional[str] = None
     customer_name: Optional[str] = None
     issue_description: Optional[str] = None
     preferred_date: Optional[str] = None        # YYYY-MM-DD
@@ -53,6 +54,7 @@ class CallSlots(BaseModel):
     booking_id: Optional[str] = None            # for reschedule / cancel
     confirmed: bool = False
     after_hours_accepted: Optional[bool] = None  # gate for AFTER_HOURS_DISCLOSURE
+    more_help: Optional[bool] = None             # gate for WRAP_UP / OUT_OF_AREA
 
 
 class CallSession(BaseModel):
@@ -69,6 +71,7 @@ class CallSession(BaseModel):
     started_at: datetime = Field(default_factory=datetime.utcnow)
     is_emergency: bool = False
     available_slots: Optional[List[Dict]] = None  # fetched on entering COLLECTING_BOOKING_DETAILS
+    slot_offer_index: int = 0  # tracks which available slot we are currently offering
 
 
 class LLMTurnResult(BaseModel):

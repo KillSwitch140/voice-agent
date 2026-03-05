@@ -26,12 +26,23 @@ def detect_emergency(text: str) -> bool:
 
 # ─── Service area ─────────────────────────────────────────────────────────────
 
-TORONTO_POSTAL_PREFIXES: set[str] = {
-    "M1", "M2", "M3", "M4", "M5", "M6", "M7", "M8", "M9",
+GTA_CITIES: set[str] = {
+    # City of Toronto + former municipalities
+    "toronto", "north york", "scarborough", "etobicoke", "east york", "york",
+    # Peel Region
+    "mississauga", "brampton", "caledon",
+    # York Region
+    "vaughan", "markham", "richmond hill", "newmarket", "aurora",
+    "king", "king city", "east gwillimbury", "georgina", "stouffville",
+    "whitchurch-stouffville",
+    # Durham Region
+    "ajax", "whitby", "oshawa", "pickering", "uxbridge", "clarington", "bowmanville",
+    # Halton Region
+    "oakville", "burlington", "halton hills", "georgetown", "milton",
 }
 
 
-def is_toronto_service_area(postal_code: str) -> bool:
-    prefix = postal_code.upper().replace(" ", "")[:2]
-    return prefix in TORONTO_POSTAL_PREFIXES
+def is_gta_city(city: str) -> bool:
+    """Return True if the caller's city is within the Greater Toronto Area service area."""
+    return city.strip().lower() in GTA_CITIES
 
