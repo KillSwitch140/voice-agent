@@ -18,7 +18,7 @@ This is a revenue-focused automation system.
 
 ---
 
-# 1. System Purpose
+## 1. System Purpose
 
 The system replaces or augments an HVAC receptionist in Toronto.
 
@@ -42,7 +42,7 @@ Primary KPI:
 
 ---
 
-# 2. Architectural Principles
+## 2. Architectural Principles
 
 Claude must follow these constraints:
 
@@ -58,7 +58,7 @@ Do NOT introduce unnecessary frameworks or abstraction layers.
 
 ---
 
-# 3. High-Level Architecture
+## 3. High-Level Architecture
 
 Call Flow:
 
@@ -66,7 +66,7 @@ Call Flow:
 2. Twilio webhook → FastAPI Orchestrator (`POST /voice/inbound`)
 3. TwiML opens bidirectional Media Stream WebSocket
 4. Audio streamed to Deepgram STT (mulaw 8kHz)
-5. Final transcript → GPT-4o-mini (intent + slot extraction)
+5. Final transcript → regex fast path (yes/no states bypass LLM) OR GPT-4o-mini (intent + slot extraction)
 6. State machine advances deterministically
 7. Orchestrator calls booking tools directly (not via LLM)
 8. Response text → Deepgram Aura TTS → mulaw audio → Twilio
@@ -76,7 +76,7 @@ Key design decision: **the LLM only classifies intent and extracts slots. All bo
 
 ---
 
-# 4. Directory Structure
+## 4. Directory Structure
 
 ```
 apps/
@@ -96,12 +96,13 @@ apps/
     pricing/           — after_hours_fees.json
     policies/          — emergency_triage.md
     scripts/           — call_opening.txt, safety_gas_smell.txt
-    service_area/      — toronto_postal_prefixes.json
+    service_area/      — gta_cities.json (city-name set for GTA service area check)
+    test_client.html   — Browser WebRTC test UI (served at /voice/test-client)
 
 packages/
   core/
     models.py          — CallSession, CallState, Intent, LLMTurnResult
-    utils.py           — detect_emergency(), is_toronto_service_area()
+    utils.py           — detect_emergency(), is_gta_city()
 
 sql/
   schema.sql           — Full Supabase schema + seed data
@@ -112,7 +113,7 @@ infra/
 
 ---
 
-# 5. Tools (Direct Function Calls)
+## 5. Tools (Direct Function Calls)
 
 All tools are async functions in `apps/orchestrator/services/tools.py` dispatched via `call_tool(name, args)`.
 
@@ -133,11 +134,11 @@ Business rules enforced in tool code (not prompts):
 
 ---
 
-# 6. Business Logic Rules (Non-Negotiable)
+## 6. Business Logic Rules (Non-Negotiable)
 
 These rules must be implemented in backend code, not only prompts.
 
-## Emergency Overrides
+### Emergency Overrides
 
 If caller mentions: gas smell, gas leak, carbon monoxide, CO detector, smoke from furnace, fire, explosion, cannot breathe, pipes frozen
 
@@ -147,7 +148,7 @@ Then:
 - Log escalation record
 - Hang up proactively (caller must leave building)
 
-## After-Hours Slot Pricing
+### After-Hours Slot Pricing
 
 Pricing is based on the **booked appointment slot time**, not the time of the call.
 
@@ -155,14 +156,16 @@ Pricing is based on the **booked appointment slot time**, not the time of the ca
 - **Surge rate** (after-hours surcharge +$120–$180): Mon–Fri 16:00+, Sat 13:00+, all Sunday slots
 - Caller is informed via `AFTER_HOURS_DISCLOSURE` state before confirming
 
-## Service Area
+### Service Area
 
-If postal code prefix not in M1–M9 (Toronto FSA):
+If caller's city is not in the GTA city set (`gta_cities.json` / `is_gta_city()`):
 - Politely decline, send referral SMS, hang up
+- Covers: City of Toronto, Peel Region (Mississauga, Brampton, Caledon), York Region, Durham Region, Halton Region
+- Detection is city-name based (not postal code) — extracted from caller's spoken city name
 
 ---
 
-# 7. Voice UX Rules
+## 7. Voice UX Rules
 
 - Keep every response to 1–2 short sentences
 - Ask exactly one question at a time
@@ -178,7 +181,7 @@ Never:
 
 ---
 
-# 8. Database (Supabase)
+## 8. Database (Supabase)
 
 Tables: `calls`, `call_turns`, `customers`, `bookings`, `escalations`
 
@@ -190,44 +193,25 @@ Tables: `calls`, `call_turns`, `customers`, `bookings`, `escalations`
 
 ---
 
-# 9. LLM Usage Rules
+## 9. LLM Usage Rules
 
 GPT-4o-mini is used **only** for:
 - Intent classification
 - Slot/entity extraction
-- Generating voice response text (1–2 sentences)
 
 The LLM does **NOT**:
+- Generate spoken responses — all voice text is scripted Python strings; LLM `response_text` is last-resort fallback only
 - Make tool calls or trigger bookings directly
 - See the full transcript (rolling last-5 turns only)
 - Generate pricing numbers (reads from `after_hours_fees.json`)
+
+**Regex fast path**: For states where only yes/no is needed (`CONFIRMING_BOOKING`, `AFTER_HOURS_DISCLOSURE`, `WRAP_UP`, `PRICING_FOLLOWUP`), the LLM is bypassed entirely via `try_regex_extraction()` in `llm.py`. This eliminates LLM latency on the most common caller utterances.
 
 State context and available slots are injected as system messages each turn.
 
 ---
 
-# 10. Safety and Liability
-
-Never provide:
-- Gas leak troubleshooting instructions
-- Unsafe electrical guidance
-- DIY repair instructions
-
-Always redirect to licensed technician or emergency services.
-
----
-
-# 11. What This Project Is NOT
-
-- Not a generic chatbot
-- Not a multi-agent experiment
-- Not a LangChain or MCP playground
-
-It is a revenue-focused, operational voice automation system.
-
----
-
-# 12. Claude Development Behavior
+## 10. Claude Development Behavior
 
 When assisting with code:
 
@@ -242,27 +226,30 @@ When unsure: ask for clarification instead of inventing architecture.
 
 ---
 
-# 13. MVP Scope (Implemented)
+## 11. MVP Scope (Current State)
+
+> This reflects implemented features as of the last update. May drift as the project evolves.
 
 - New booking (full calendar: conflict check, future-only, 30-day limit)
 - Reschedule (validates new slot, excludes own slot from conflict check)
 - Cancellation
-- Emergency triage (hard-coded bypass)
+- Emergency triage (hard-coded bypass, pre-LLM keyword detection)
 - Pricing explanation (ranges from JSON file)
 - SMS confirmation (booking / reschedule / cancellation / out-of-area)
 - Escalation logging + outbound callback via Twilio
-- After-hours surcharge disclosure
-- Out-of-area detection + referral SMS
+- After-hours surcharge disclosure (AFTER_HOURS_DISCLOSURE state)
+- Out-of-area detection + referral SMS (city-name based, not postal code)
+- WRAP_UP state: multi-task calls (caller can book, then ask pricing, then reschedule in one call)
+- Slot-by-slot offering with pricing tier shown inline ("at our standard rate" / "at our after-hours rate")
+- Date and time-of-day slot navigation: caller can say "do you have March 15th?" or "something in the morning" to jump through available slots (`requested_date` / `requested_time_of_day` fields)
+- Regex fast path bypasses LLM for yes/no states (latency optimisation)
+- Browser WebRTC test client at `/voice/test-client` (no phone needed for testing)
 
 ---
 
-# 14. Security
+## 12. Security
 
 - All secrets stored in `.env` (never committed)
 - `.env` is listed in `.gitignore`
 - Supabase service key used server-side only
 - No secrets in source code or logs
-
----
-
-End of CLAUDE.md

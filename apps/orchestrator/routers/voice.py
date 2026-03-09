@@ -26,7 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from apps.orchestrator.config import get_settings
 from apps.orchestrator.services import session_store
 from apps.orchestrator.services.deepgram_stt import DeepgramSTT
-from apps.orchestrator.services.llm import run_turn
+from apps.orchestrator.services.llm import run_turn, try_regex_extraction
 from apps.orchestrator.services.state_machine import apply_llm_result
 from apps.orchestrator.services.supabase_logger import SupabaseLogger
 from apps.orchestrator.services.tools import call_tool, _is_slot_surge
@@ -45,16 +45,44 @@ _SAFETY_SCRIPT = (_RESOURCES / "scripts" / "safety_gas_smell.txt").read_text().s
 _OPENING_SCRIPT = (_RESOURCES / "scripts" / "call_opening.txt").read_text().strip()
 
 
+_tts_instance: TTSService | None = None
+_db_instance: SupabaseLogger | None = None
+
+# Fire-and-forget task set (prevents GC of background tasks)
+_bg_tasks: set[asyncio.Task] = set()
+
+
+def _fire_and_forget(coro) -> None:
+    """Schedule a coroutine as a fire-and-forget background task."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 def _tts() -> TTSService:
-    return TTSService(settings.deepgram_api_key)
+    global _tts_instance
+    if _tts_instance is None:
+        _tts_instance = TTSService(settings.deepgram_api_key)
+    return _tts_instance
 
 
 def _db() -> SupabaseLogger:
-    return SupabaseLogger(settings.supabase_url, settings.supabase_service_key)
+    global _db_instance
+    if _db_instance is None:
+        _db_instance = SupabaseLogger(settings.supabase_url, settings.supabase_service_key)
+    return _db_instance
 
 
 def _twilio() -> TwilioClient:
     return TwilioClient(settings.twilio_account_sid, settings.twilio_auth_token)
+
+
+async def cleanup() -> None:
+    """Close persistent clients (called on app shutdown)."""
+    if _tts_instance:
+        await _tts_instance.aclose()
+    if _db_instance:
+        await _db_instance.aclose()
 
 
 async def _hangup_call(call_sid: str) -> None:
@@ -92,6 +120,21 @@ async def _send_audio(ws: WebSocket, stream_sid: str, audio: bytes) -> None:
         "streamSid": stream_sid,
         "media": {"payload": base64.b64encode(audio).decode()},
     }))
+
+
+def _matches_time_of_day(time_slot: str, tod: str) -> bool:
+    """Return True if the slot's start hour falls in the requested time-of-day band."""
+    try:
+        start_hour = int(time_slot.split(":")[0])
+    except (ValueError, IndexError):
+        return True  # unknown format — don't filter
+    if tod == "morning":
+        return start_hour < 12
+    if tod == "afternoon":
+        return 12 <= start_hour < 16
+    if tod == "evening":
+        return start_hour >= 16
+    return True
 
 
 async def _reload_slots(session, job_type: str | None = None) -> None:
@@ -158,7 +201,7 @@ async def _run_booking_tools(session, prev_state: CallState) -> tuple:
                 "issue_description": session.slots.issue_description,
                 "preferred_date": session.slots.preferred_date,
                 "preferred_time": session.slots.preferred_time,
-                "call_id": session.call_id or session.call_sid,
+                "call_id": session.call_id or "",
                 "is_emergency": session.is_emergency,
             })
             if result.get("success"):
@@ -179,9 +222,19 @@ async def _run_booking_tools(session, prev_state: CallState) -> tuple:
                     "I'll connect you with a team member right away."
                 )
             else:
-                logger.warning("create_booking error: %s", result)
+                logger.error("create_booking failed: %s", result)
+                session.state = CallState.ESCALATING
+                response_override = (
+                    "I'm sorry, I'm having trouble saving your booking right now. "
+                    "Let me connect you with a team member who can help."
+                )
         except Exception as exc:
-            logger.warning("create_booking failed: %s", exc)
+            logger.error("create_booking exception: %s", exc)
+            session.state = CallState.ESCALATING
+            response_override = (
+                "I'm sorry, I'm having trouble saving your booking right now. "
+                "Let me connect you with a team member who can help."
+            )
 
     elif session.intent == Intent.RESCHEDULE and session.slots.booking_id:
         try:
@@ -246,6 +299,93 @@ _PRICING_SCRIPT = (
 )
 
 
+def _transition_overrides(session, prev_state: CallState, response_override: str | None) -> str | None:
+    """Apply deterministic response overrides for state transitions.
+
+    Shared between _process_transcript and /simulate. May modify session.slots
+    (e.g. resetting confirmed=False when entering CONFIRMING_BOOKING).
+    Returns the response override text, or the incoming override if a booking tool
+    already set one.
+    """
+    if response_override is not None:
+        return response_override
+
+    # 1. After city: capabilities menu (GTA city) or out-of-area rejection
+    if prev_state == CallState.COLLECTING_CITY:
+        if session.state == CallState.INTENT_DETECTION:
+            name = session.slots.customer_name or ""
+            return (
+                f"Great{', ' + name if name else ''}! "
+                "I can help you book a new service appointment, reschedule or cancel an existing "
+                "booking, or answer pricing questions. What can I help you with today?"
+            )
+        if session.state == CallState.OUT_OF_AREA:
+            city = session.slots.city or "your area"
+            return (
+                "I'm sorry, we only service the Greater Toronto Area. "
+                f"Unfortunately, {city} is outside our coverage area. Have a great day!"
+            )
+
+    # 2. Entering CONFIRMING_BOOKING: always ask the confirmation question.
+    #    Reset confirmed=False to prevent premature skip to CLOSING.
+    if (prev_state != CallState.CONFIRMING_BOOKING
+            and session.state == CallState.CONFIRMING_BOOKING):
+        session.slots = session.slots.model_copy(update={"confirmed": False})
+        if session.intent == Intent.CANCELLATION:
+            return (
+                f"Just to confirm, you'd like to cancel booking "
+                f"{session.slots.booking_id}. Is that correct?"
+            )
+        if session.intent == Intent.RESCHEDULE and session.slots.preferred_date and session.slots.preferred_time:
+            return (
+                f"Just to confirm, we'll reschedule your appointment to "
+                f"{_fmt_date(session.slots.preferred_date)} "
+                f"at {_fmt_time(session.slots.preferred_time)}. Is that correct?"
+            )
+        if session.slots.preferred_date and session.slots.preferred_time:
+            return (
+                f"Just to confirm, we have you booked for "
+                f"{_fmt_date(session.slots.preferred_date)} "
+                f"at {_fmt_time(session.slots.preferred_time)}. Shall I go ahead?"
+            )
+
+    # 3. CONFIRMING_BOOKING → CLOSING: booking is done.
+    if (prev_state == CallState.CONFIRMING_BOOKING
+            and session.state == CallState.CLOSING):
+        if session.intent == Intent.CANCELLATION:
+            return "Your booking has been cancelled."
+        if session.intent == Intent.RESCHEDULE:
+            return (
+                f"Your appointment has been rescheduled to "
+                f"{_fmt_date(session.slots.preferred_date)} "
+                f"at {_fmt_time(session.slots.preferred_time)}."
+            )
+        return (
+            f"You're all set! We have you booked for "
+            f"{_fmt_date(session.slots.preferred_date)} "
+            f"at {_fmt_time(session.slots.preferred_time)}."
+        )
+
+    # 4. Entering WRAP_UP from any state: always ask "anything else?"
+    if prev_state != CallState.WRAP_UP and session.state == CallState.WRAP_UP:
+        return "Is there anything else I can help you with today?"
+
+    # 5. WRAP_UP → INTENT_DETECTION (caller wants more help).
+    if prev_state == CallState.WRAP_UP and session.state == CallState.INTENT_DETECTION:
+        name = session.slots.customer_name or ""
+        return (
+            f"Of course{', ' + name if name else ''}! "
+            "I can help you book a new service appointment, reschedule or cancel an existing "
+            "booking, or answer pricing questions. What can I help you with today?"
+        )
+
+    # 6. WRAP_UP → ENDED (caller is done).
+    if prev_state == CallState.WRAP_UP and session.state == CallState.ENDED:
+        return "Thank you for calling Toronto HVAC Services. Have a great day!"
+
+    return None
+
+
 def _scripted_response(session, prev_state: CallState) -> str | None:
     """Return the deterministic spoken response for the current state.
 
@@ -284,13 +424,15 @@ def _scripted_response(session, prev_state: CallState) -> str | None:
     if state == CallState.COLLECTING_BOOKING_DETAILS:
         if not slots.issue_description:
             return "What's the issue with your HVAC system?"
-        # Issue collected — offer a slot from the available list.
+        # Issue collected — offer a slot from the available list with pricing tier.
         if session.available_slots:
             idx = min(session.slot_offer_index, len(session.available_slots) - 1)
             slot = session.available_slots[idx]
+            tier = slot.get("pricing_tier", "standard")
+            rate_info = "at our standard rate" if tier == "standard" else "at our after-hours rate"
             return (
-                f"We have {_fmt_date(slot['date'])} at {_fmt_time(slot['time_slot'])} — "
-                "does that work for you?"
+                f"We have {_fmt_date(slot['date'])} at {_fmt_time(slot['time_slot'])}, "
+                f"{rate_info}. Does that work for you?"
             )
         # Slots not loaded yet (still fetching or none available).
         return "What day and time works best for you?"
@@ -372,7 +514,7 @@ async def _process_transcript(transcript: str, call_sid: str, ws: WebSocket) -> 
     # Add user turn to rolling context
     session.turns.append({"role": "user", "content": transcript})
     if session.call_id:
-        await db.log_turn(session.call_id, "user", transcript, session.state.value)
+        _fire_and_forget(db.log_turn(session.call_id, "user", transcript, session.state.value))
 
     # 3. LLM turn — extraction only; Python generates all spoken responses.
     # Track whether we were already in slot-offering mode before this turn so we
@@ -383,11 +525,14 @@ async def _process_transcript(transcript: str, call_sid: str, ws: WebSocket) -> 
         and bool(session.available_slots)
     )
 
-    llm_result = await run_turn(
-        session=session,
-        utterance=transcript,
-        openai_api_key=settings.openai_api_key,
-    )
+    # Fast path: regex extraction for simple yes/no states (skips LLM entirely)
+    llm_result = try_regex_extraction(session, transcript)
+    if llm_result is None:
+        llm_result = await run_turn(
+            session=session,
+            utterance=transcript,
+            openai_api_key=settings.openai_api_key,
+        )
 
     # 4. Apply result to state machine
     prev_state = session.state
@@ -397,108 +542,48 @@ async def _process_transcript(transcript: str, call_sid: str, ws: WebSocket) -> 
     session = await _fetch_availability(session, prev_state)
     session, response_override = await _run_booking_tools(session, prev_state)
 
-    # If the caller declined a slot offer (no preferred_date extracted while we were
-    # offering), advance to the next available slot for the scripted response.
-    if (was_offering_slot
-            and session.state == CallState.COLLECTING_BOOKING_DETAILS
-            and not session.slots.preferred_date
-            and session.available_slots):
-        session.slot_offer_index = min(
-            session.slot_offer_index + 1,
-            len(session.available_slots) - 1,
-        )
-
-    # ── Deterministic response overrides ──────────────────────────────────────
-    # These replace the LLM response for state transitions where the message
-    # must be exact and consistent, not LLM-generated.
-
-    # 1. After city: capabilities menu (GTA city) or out-of-area rejection
-    if prev_state == CallState.COLLECTING_CITY:
-        if session.state == CallState.INTENT_DETECTION:
-            name = session.slots.customer_name or ""
-            response_override = (
-                f"Great{', ' + name if name else ''}! "
-                "I can help you book a new service appointment, reschedule or cancel an existing "
-                "booking, or answer pricing questions. What can I help you with today?"
+    # Navigate slot_offer_index based on caller's date/time-of-day preference or decline.
+    if session.state == CallState.COLLECTING_BOOKING_DETAILS and session.available_slots:
+        req_date = session.slots.requested_date
+        tod = session.slots.requested_time_of_day
+        if req_date or tod:
+            # Determine start index: jump to requested date, or stay at current index.
+            if req_date:
+                start_idx = next(
+                    (i for i, s in enumerate(session.available_slots) if s["date"] >= req_date),
+                    len(session.available_slots) - 1,
+                )
+            else:
+                start_idx = session.slot_offer_index
+            # Apply time-of-day filter from start_idx onward.
+            if tod:
+                session.slot_offer_index = next(
+                    (i for i in range(start_idx, len(session.available_slots))
+                     if _matches_time_of_day(session.available_slots[i]["time_slot"], tod)),
+                    min(start_idx, len(session.available_slots) - 1),
+                )
+            else:
+                session.slot_offer_index = start_idx
+            session.slots = session.slots.model_copy(
+                update={"requested_date": None, "requested_time_of_day": None}
             )
-        elif session.state == CallState.OUT_OF_AREA:
-            city = session.slots.city or "your area"
-            response_override = (
-                "I'm sorry, we only service the Greater Toronto Area. "
-                f"Unfortunately, {city} is outside our coverage area. Have a great day!"
-            )
-
-    # 2. Entering CONFIRMING_BOOKING: always ask the confirmation question so the
-    #    LLM cannot treat "thank you" or "okay" as implicit confirmation.
-    #    Also reset confirmed=False to prevent a premature confirmed=True (set
-    #    when user says "yes" to a slot offer) from instantly skipping to CLOSING.
-    elif (prev_state != CallState.CONFIRMING_BOOKING
-          and session.state == CallState.CONFIRMING_BOOKING):
-        session.slots = session.slots.model_copy(update={"confirmed": False})
-        if session.intent == Intent.CANCELLATION:
-            response_override = (
-                f"Just to confirm, you'd like to cancel booking "
-                f"{session.slots.booking_id}. Is that correct?"
-            )
-        elif session.intent == Intent.RESCHEDULE and session.slots.preferred_date and session.slots.preferred_time:
-            response_override = (
-                f"Just to confirm, we'll reschedule your appointment to "
-                f"{_fmt_date(session.slots.preferred_date)} "
-                f"at {_fmt_time(session.slots.preferred_time)}. Is that correct?"
-            )
-        elif session.slots.preferred_date and session.slots.preferred_time:
-            response_override = (
-                f"Just to confirm, we have you booked for "
-                f"{_fmt_date(session.slots.preferred_date)} "
-                f"at {_fmt_time(session.slots.preferred_time)}. Shall I go ahead?"
+        elif was_offering_slot and not session.slots.preferred_date:
+            # Caller declined the offered slot — advance to the next one.
+            session.slot_offer_index = min(
+                session.slot_offer_index + 1,
+                len(session.available_slots) - 1,
             )
 
-    # 3. CONFIRMING_BOOKING → CLOSING: booking is done, play the completion line.
-    elif (prev_state == CallState.CONFIRMING_BOOKING
-          and session.state == CallState.CLOSING):
-        if session.intent == Intent.CANCELLATION:
-            response_override = "Your booking has been cancelled."
-        elif session.intent == Intent.RESCHEDULE:
-            response_override = (
-                f"Your appointment has been rescheduled to "
-                f"{_fmt_date(session.slots.preferred_date)} "
-                f"at {_fmt_time(session.slots.preferred_time)}."
-            )
-        else:
-            response_override = (
-                f"You're all set! We have you booked for "
-                f"{_fmt_date(session.slots.preferred_date)} "
-                f"at {_fmt_time(session.slots.preferred_time)}."
-            )
+    # ── Deterministic response overrides (shared with /simulate) ─────────────
+    response_override = _transition_overrides(session, prev_state, response_override)
 
-    # 4. Entering WRAP_UP from any state: always ask "anything else?" deterministically.
-    #    Catches CLOSING→WRAP_UP, PRICING_FOLLOWUP→WRAP_UP, AFTER_HOURS declined→WRAP_UP, etc.
-    #    Must check session.state (not prev_state) since apply_llm_result has already
-    #    advanced the state before this block runs.
-    elif prev_state != CallState.WRAP_UP and session.state == CallState.WRAP_UP:
-        response_override = "Is there anything else I can help you with today?"
-
-    # 5. WRAP_UP → INTENT_DETECTION (caller wants more help): re-present capabilities menu.
-    elif prev_state == CallState.WRAP_UP and session.state == CallState.INTENT_DETECTION:
-        name = session.slots.customer_name or ""
-        response_override = (
-            f"Of course{', ' + name if name else ''}! "
-            "I can help you book a new service appointment, reschedule or cancel an existing "
-            "booking, or answer pricing questions. What can I help you with today?"
-        )
-
-    # 6. WRAP_UP → ENDED (caller is done): always say goodbye before the call ends.
-    #    Emergency and escalation never go through WRAP_UP so they are unaffected.
-    elif prev_state == CallState.WRAP_UP and session.state == CallState.ENDED:
-        response_override = "Thank you for calling Toronto HVAC Services. Have a great day!"
-
-    # 5. Speak the response — scripted responses cover every state; LLM text is last resort.
+    # Speak the response — scripted responses cover every state; LLM text is last resort.
     if response_override is None:
         response_override = _scripted_response(session, prev_state)
     response_text = response_override or llm_result.response_text or "I'm sorry, could you repeat that?"
     session.turns.append({"role": "assistant", "content": response_text})
     if session.call_id:
-        await db.log_turn(session.call_id, "assistant", response_text, session.state.value)
+        _fire_and_forget(db.log_turn(session.call_id, "assistant", response_text, session.state.value))
     response_audio = await tts.synthesize(response_text)
     await _send_audio(ws, session.stream_sid, response_audio)
     # mulaw 8kHz = 8000 bytes/sec — used below to wait for playback before hangup
@@ -684,6 +769,7 @@ async def media_stream(websocket: WebSocket, call_sid: str):
 
             if event == "start":
                 session.stream_sid = msg["streamSid"]
+                session.turns.append({"role": "assistant", "content": _OPENING_SCRIPT})
                 session_store.save_session(session)
                 logger.info("Stream started: %s", session.stream_sid)
                 await _send_audio(websocket, session.stream_sid, await tts.synthesize(_OPENING_SCRIPT))
@@ -745,12 +831,19 @@ async def simulate(request: Request):
         session_store.save_session(session)
 
     if detect_emergency(transcript):
+        session.is_emergency = True
+        session.state = CallState.EMERGENCY_TRIAGE
+        session_store.save_session(session)
         return {
             "call_sid": call_sid,
             "response": _SAFETY_SCRIPT,
             "state": "emergency_triage",
             "is_emergency": True,
         }
+
+    # Pre-advance GREETING → COLLECTING_CUSTOMER_INFO (same as live path)
+    if session.state == CallState.GREETING:
+        session.state = CallState.COLLECTING_CUSTOMER_INFO
 
     session.turns.append({"role": "user", "content": transcript})
 
@@ -760,27 +853,51 @@ async def simulate(request: Request):
         and bool(session.available_slots)
     )
 
-    llm_result = await run_turn(
-        session=session,
-        utterance=transcript,
-        openai_api_key=settings.openai_api_key,
-    )
+    # Fast path: regex extraction for simple yes/no states (skips LLM entirely)
+    llm_result = try_regex_extraction(session, transcript)
+    if llm_result is None:
+        llm_result = await run_turn(
+            session=session,
+            utterance=transcript,
+            openai_api_key=settings.openai_api_key,
+        )
     prev_state = session.state
     session = apply_llm_result(session, llm_result)
 
-    # 4a+4b. Same availability fetch + booking tool logic as the live call path
+    # Same availability fetch + booking tool logic as the live call path
     session = await _fetch_availability(session, prev_state)
     session, response_override = await _run_booking_tools(session, prev_state)
 
-    if (was_offering_slot
-            and session.state == CallState.COLLECTING_BOOKING_DETAILS
-            and not session.slots.preferred_date
-            and session.available_slots):
-        session.slot_offer_index = min(
-            session.slot_offer_index + 1,
-            len(session.available_slots) - 1,
-        )
+    if session.state == CallState.COLLECTING_BOOKING_DETAILS and session.available_slots:
+        req_date = session.slots.requested_date
+        tod = session.slots.requested_time_of_day
+        if req_date or tod:
+            if req_date:
+                start_idx = next(
+                    (i for i, s in enumerate(session.available_slots) if s["date"] >= req_date),
+                    len(session.available_slots) - 1,
+                )
+            else:
+                start_idx = session.slot_offer_index
+            if tod:
+                session.slot_offer_index = next(
+                    (i for i in range(start_idx, len(session.available_slots))
+                     if _matches_time_of_day(session.available_slots[i]["time_slot"], tod)),
+                    min(start_idx, len(session.available_slots) - 1),
+                )
+            else:
+                session.slot_offer_index = start_idx
+            session.slots = session.slots.model_copy(
+                update={"requested_date": None, "requested_time_of_day": None}
+            )
+        elif was_offering_slot and not session.slots.preferred_date:
+            session.slot_offer_index = min(
+                session.slot_offer_index + 1,
+                len(session.available_slots) - 1,
+            )
 
+    # Apply the same transition overrides as the live call path
+    response_override = _transition_overrides(session, prev_state, response_override)
     if response_override is None:
         response_override = _scripted_response(session, prev_state)
     response_text = response_override or llm_result.response_text or "I'm sorry, could you repeat that?"

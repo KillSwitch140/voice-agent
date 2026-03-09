@@ -19,10 +19,104 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 
-from packages.core.models import CallSession, LLMTurnResult
+from packages.core.models import CallSession, CallState, LLMTurnResult
 from apps.orchestrator.services.state_machine import get_missing_slots
 
 logger = logging.getLogger(__name__)
+
+# ─── Persistent OpenAI client ────────────────────────────────────────────────
+
+_openai_client: AsyncOpenAI | None = None
+
+
+def _get_openai_client(api_key: str) -> AsyncOpenAI:
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = AsyncOpenAI(api_key=api_key)
+    return _openai_client
+
+
+async def close_llm_client() -> None:
+    global _openai_client
+    if _openai_client:
+        await _openai_client.close()
+        _openai_client = None
+
+
+# ─── Regex extraction (LLM bypass for simple states) ─────────────────────────
+
+_YES_PHRASES = frozenset({
+    "yes", "yeah", "yep", "sure", "okay", "ok", "go ahead", "sounds good",
+    "that works", "correct", "right", "absolutely", "definitely", "please",
+    "proceed", "let's do it", "book it", "yes please", "yea", "alright",
+    "that's fine", "perfect", "great", "i'd like that", "do it",
+    "yes that's correct", "yes go ahead", "yes proceed", "yes sure",
+    "sure thing", "yes that works", "sounds great", "that sounds good",
+    "yes it is", "yes i do", "yes i would",
+})
+_NO_PHRASES = frozenset({
+    "no", "nope", "nah", "no thanks", "no thank you", "not right now",
+    "cancel", "never mind", "nevermind", "that's all", "nothing else",
+    "i'm good", "i'm done", "goodbye", "bye", "not today",
+    "no that's all", "no that's it", "no i'm good", "no i'm done",
+    "no thanks that's all", "no thank you goodbye", "no not right now",
+    "not at this time", "that's everything",
+})
+# Short prefix words: if the entire utterance starts with one of these and is
+# short enough (≤6 words), treat it as yes/no without LLM.
+_YES_STARTS = ("yes", "yeah", "yep", "sure", "okay", "ok", "absolutely", "definitely", "please", "correct", "right", "alright", "perfect", "great")
+_NO_STARTS = ("no", "nope", "nah", "not", "never", "goodbye", "bye")
+
+
+def _is_yes(text: str) -> bool:
+    lower = text.strip().lower().rstrip(".!,?")
+    if lower in _YES_PHRASES:
+        return True
+    words = lower.split()
+    return len(words) <= 6 and words[0] in _YES_STARTS if words else False
+
+
+def _is_no(text: str) -> bool:
+    lower = text.strip().lower().rstrip(".!,?")
+    if lower in _NO_PHRASES:
+        return True
+    words = lower.split()
+    return len(words) <= 6 and words[0] in _NO_STARTS if words else False
+
+
+def try_regex_extraction(session: CallSession, utterance: str) -> LLMTurnResult | None:
+    """Attempt to extract data without the LLM. Returns None if LLM is needed."""
+    state = session.state
+
+    if state == CallState.CONFIRMING_BOOKING:
+        if _is_yes(utterance):
+            return LLMTurnResult(extracted_slots={"confirmed": True}, response_text="")
+        if _is_no(utterance):
+            return LLMTurnResult(extracted_slots={"confirmed": False}, response_text="")
+
+    elif state == CallState.AFTER_HOURS_DISCLOSURE:
+        if _is_yes(utterance):
+            return LLMTurnResult(extracted_slots={"after_hours_accepted": True}, response_text="")
+        if _is_no(utterance):
+            return LLMTurnResult(extracted_slots={"after_hours_accepted": False}, response_text="")
+
+    elif state == CallState.WRAP_UP:
+        if _is_yes(utterance):
+            return LLMTurnResult(extracted_slots={"more_help": True}, response_text="")
+        if _is_no(utterance):
+            return LLMTurnResult(extracted_slots={"more_help": False}, response_text="")
+
+    elif state == CallState.PRICING:
+        # No extraction needed — state machine always advances to PRICING_FOLLOWUP
+        return LLMTurnResult(response_text="")
+
+    elif state == CallState.PRICING_FOLLOWUP:
+        if _is_yes(utterance):
+            return LLMTurnResult(intent="new_booking", response_text="")
+        if _is_no(utterance):
+            return LLMTurnResult(intent="unknown", response_text="")
+
+    return None  # LLM needed
 
 _PRICING_RESOURCE = Path(__file__).parents[3] / "apps" / "resources" / "pricing" / "after_hours_fees.json"
 
@@ -63,6 +157,8 @@ OUTPUT FORMAT (JSON only, no prose):
     "issue_description": null,
     "preferred_date": null,
     "preferred_time": null,
+    "requested_date": null,
+    "requested_time_of_day": null,
     "booking_id": null,
     "confirmed": null,
     "after_hours_accepted": null,
@@ -99,9 +195,21 @@ _STATE_GUIDANCE: dict[str, str] = {
     ),
     "collecting_booking_details": (
         "Extract issue_description from any problem description.\n"
-        "Extract preferred_date (YYYY-MM-DD) and preferred_time (e.g. '10:00-12:00') "
-        "ONLY when the caller explicitly accepts or names a specific slot from [Available slots]. "
-        "Do NOT extract date/time if caller says no, doesn't work, different day, or similar."
+        "When the caller states a specific date AND time (e.g. '5pm on March 10th', 'March 10 in the evening'):\n"
+        "  - Find the closest slot from [Available slots] on that date.\n"
+        "  - Extract as preferred_date (YYYY-MM-DD) and preferred_time (exact slot string, e.g. '16:00-18:00').\n"
+        "  - preferred_time MUST exactly match a slot string in [Available slots] — never invent a new time.\n"
+        "When the caller asks about or requests a date without specifying an exact time "
+        "(e.g. 'do you have March 10th?', 'I want something on March 11th', 'how about March 10'):\n"
+        "  - Extract that date as requested_date (YYYY-MM-DD). Leave preferred_date and preferred_time null.\n"
+        "When the caller mentions a time-of-day preference (morning / afternoon / evening) without "
+        "accepting a specific slot, extract requested_time_of_day as one of: 'morning', 'afternoon', 'evening'.\n"
+        "  - morning: before noon (e.g. '9am', 'in the morning').\n"
+        "  - afternoon: noon to 4pm (e.g. 'after lunch', 'early afternoon').\n"
+        "  - evening: 4pm or later (e.g. 'after 4', 'in the evening', '5pm', '6pm').\n"
+        "requested_time_of_day can be extracted together with requested_date (e.g. 'March 10 in the evening').\n"
+        "Do NOT extract preferred_date, preferred_time, requested_date, or requested_time_of_day "
+        "if caller says no, doesn't work, or declines without naming a new date or time."
     ),
     "collecting_booking_details_reschedule": (
         "Extract preferred_date and preferred_time ONLY when caller accepts a slot. "
@@ -200,7 +308,7 @@ async def run_turn(
     Booking tool calls (create/reschedule/cancel) are handled deterministically
     by the orchestrator based on state machine state — not by the LLM.
     """
-    client = AsyncOpenAI(api_key=openai_api_key)
+    client = _get_openai_client(openai_api_key)
     messages = _build_context_messages(session, utterance)
 
     response = await client.chat.completions.create(

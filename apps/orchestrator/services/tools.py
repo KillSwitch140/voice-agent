@@ -24,6 +24,8 @@ from typing import Any
 import httpx
 import pytz
 
+from apps.orchestrator.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 _RESOURCES_DIR = Path(__file__).parents[3] / "apps" / "resources"
@@ -76,68 +78,91 @@ def _is_slot_surge(date_str: str, time_slot: str) -> bool:
     return True  # unknown slot → default to surge (safe)
 
 
+# ─── Shared HTTP client (persistent, connection-pooled) ─────────────────────
+
+_http: httpx.AsyncClient | None = None
+_base_url: str = ""
+
+
+def _ensure_client() -> None:
+    """Lazily initialize the shared httpx client using app settings."""
+    global _http, _base_url
+    if _http is not None:
+        return
+    s = get_settings()
+    _base_url = f"{s.supabase_url.rstrip('/')}/rest/v1"
+    _http = httpx.AsyncClient(
+        timeout=10,
+        headers={
+            "apikey": s.supabase_service_key,
+            "Authorization": f"Bearer {s.supabase_service_key}",
+            "Content-Type": "application/json",
+        },
+    )
+    logger.info("Supabase HTTP client initialized: %s", _base_url)
+
+
+async def close_http_client() -> None:
+    """Close the shared HTTP client (called on app shutdown)."""
+    global _http
+    if _http:
+        await _http.aclose()
+        _http = None
+
+
 # ─── Supabase helpers ─────────────────────────────────────────────────────────
-
-def _sb_headers() -> dict:
-    key = os.getenv("SUPABASE_SERVICE_KEY", "")
-    return {
-        "apikey": key,
-        "Authorization": f"Bearer {key}",
-        "Content-Type": "application/json",
-    }
-
-
-def _sb_url(table: str) -> str:
-    return f"{os.getenv('SUPABASE_URL', '')}/rest/v1/{table}"
-
 
 async def _sb_get(table: str, params) -> list:
     """params can be a dict or a list of (key, val) tuples (use tuples for duplicate keys)."""
+    _ensure_client()
     pairs = list(params.items()) if isinstance(params, dict) else list(params)
     pairs.append(("select", "*"))
-    async with httpx.AsyncClient(timeout=5) as c:
-        r = await c.get(_sb_url(table), params=pairs, headers=_sb_headers())
+    r = await _http.get(f"{_base_url}/{table}", params=pairs)
+    if r.status_code != 200:
+        logger.warning("Supabase GET %s failed (%d): %s", table, r.status_code, r.text[:200])
     return r.json() if r.status_code == 200 else []
 
 
 async def _sb_post(table: str, payload: dict) -> dict:
-    async with httpx.AsyncClient(timeout=5) as c:
-        r = await c.post(
-            _sb_url(table),
-            json=payload,
-            headers={**_sb_headers(), "Prefer": "return=representation"},
-        )
+    _ensure_client()
+    r = await _http.post(
+        f"{_base_url}/{table}",
+        json=payload,
+        headers={"Prefer": "return=representation"},
+    )
+    if r.status_code not in (200, 201):
+        logger.warning("Supabase POST %s failed (%d): %s", table, r.status_code, r.text[:200])
     return {"ok": r.status_code in (200, 201), "body": r.text}
 
 
 async def _sb_patch(table: str, filter_param: str, filter_val: str, payload: dict) -> dict:
-    async with httpx.AsyncClient(timeout=5) as c:
-        r = await c.patch(
-            _sb_url(table),
-            params={filter_param: f"eq.{filter_val}"},
-            json=payload,
-            headers=_sb_headers(),
-        )
+    _ensure_client()
+    r = await _http.patch(
+        f"{_base_url}/{table}",
+        params={filter_param: f"eq.{filter_val}"},
+        json=payload,
+    )
+    if r.status_code not in (200, 204):
+        logger.warning("Supabase PATCH %s failed (%d): %s", table, r.status_code, r.text[:200])
     return {"ok": r.status_code in (200, 204)}
 
 
 async def _upsert_customer(phone: str, name: str, city: str) -> None:
     """Insert or update a customer record keyed by phone number."""
+    _ensure_client()
     try:
-        async with httpx.AsyncClient(timeout=5) as c:
-            await c.post(
-                _sb_url("customers"),
-                json={
-                    "phone": phone,
-                    "name": name,
-                    "city": city,
-                    "updated_at": datetime.utcnow().isoformat(),
-                },
-                headers={
-                    **_sb_headers(),
-                    "Prefer": "resolution=merge-duplicates,return=minimal",
-                },
-            )
+        r = await _http.post(
+            f"{_base_url}/customers",
+            json={
+                "phone": phone,
+                "name": name,
+                "postal_code": city,     # live DB column (stores city name)
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+            headers={"Prefer": "resolution=merge-duplicates,return=minimal"},
+        )
+        if r.status_code not in (200, 201, 204):
+            logger.warning("Customer upsert failed (%d): %s", r.status_code, r.text[:200])
     except Exception as exc:
         logger.warning("Customer upsert failed for %s: %s", phone, exc)
 
@@ -242,14 +267,22 @@ async def create_booking(
     # 4. Upsert customer
     await _upsert_customer(phone, customer_name, city)
 
-    # 5. Create booking row
+    # 5. Verify call_id FK exists (if provided) — skip FK if call record is missing
+    actual_call_id = None
+    if call_id:
+        existing_call = await _sb_get("calls", {"id": f"eq.{call_id}"})
+        actual_call_id = call_id if existing_call else None
+        if not existing_call:
+            logger.warning("call_id %s not found in calls table — booking without FK", call_id)
+
+    # 6. Create booking row
     booking_id = f"bk_{uuid.uuid4().hex[:12]}"
     payload = {
         "id": booking_id,
-        "call_id": call_id or None,
+        "call_id": actual_call_id,
         "customer_name": customer_name,
         "phone": phone,
-        "city": city,
+        "postal_code": city,     # live DB column (stores city name)
         "issue_description": issue_description,
         "preferred_date": preferred_date,
         "preferred_time_slot": preferred_time,
@@ -263,6 +296,7 @@ async def create_booking(
         logger.info("Booking created: %s (%s, %s %s, tier=%s)",
                     booking_id, customer_name, preferred_date, preferred_time, pricing_tier)
         return {"success": True, "booking_id": booking_id, "pricing_tier": pricing_tier}
+    logger.error("Booking DB insert failed: %s", result["body"][:300])
     return {"success": False, "error": "db_error", "detail": result["body"]}
 
 
@@ -360,10 +394,11 @@ async def send_sms(phone: str, message: str) -> dict:
 
     def _send() -> dict:
         try:
-            client = Client(os.getenv("TWILIO_ACCOUNT_SID", ""), os.getenv("TWILIO_AUTH_TOKEN", ""))
+            s = get_settings()
+            client = Client(s.twilio_account_sid, s.twilio_auth_token)
             msg = client.messages.create(
                 body=message,
-                from_=os.getenv("TWILIO_PHONE_NUMBER", ""),
+                from_=s.twilio_phone_number,
                 to=phone,
             )
             return {"success": True, "sid": msg.sid}

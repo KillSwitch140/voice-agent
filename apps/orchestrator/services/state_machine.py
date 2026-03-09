@@ -97,6 +97,8 @@ def apply_llm_result(session: CallSession, result: LLMTurnResult) -> CallSession
             "issue_description": None,
             "preferred_date": None,
             "preferred_time": None,
+            "requested_date": None,
+            "requested_time_of_day": None,
             "confirmed": False,
             "after_hours_accepted": None,
             "more_help": None,

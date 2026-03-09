@@ -49,8 +49,10 @@ class CallSlots(BaseModel):
     city: Optional[str] = None
     customer_name: Optional[str] = None
     issue_description: Optional[str] = None
-    preferred_date: Optional[str] = None        # YYYY-MM-DD
-    preferred_time: Optional[str] = None        # e.g. "10:00-12:00"
+    preferred_date: Optional[str] = None        # YYYY-MM-DD — confirmed slot date
+    preferred_time: Optional[str] = None        # e.g. "10:00-12:00" — confirmed slot time
+    requested_date: Optional[str] = None        # YYYY-MM-DD — caller asked about this date (navigation only, not committed)
+    requested_time_of_day: Optional[str] = None # "morning" | "afternoon" | "evening" — time-of-day preference (navigation only)
     booking_id: Optional[str] = None            # for reschedule / cancel
     confirmed: bool = False
     after_hours_accepted: Optional[bool] = None  # gate for AFTER_HOURS_DISCLOSURE

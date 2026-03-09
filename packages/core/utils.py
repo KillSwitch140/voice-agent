@@ -12,7 +12,8 @@ EMERGENCY_KEYWORDS: list[str] = [
     # Explosion / loud bang
     "explosion", "exploded", "loud bang from furnace",
     # Frozen / burst pipes (water damage + flooding risk)
-    "pipes frozen", "frozen pipes", "pipe burst", "burst pipe",
+    "pipes frozen", "pipes are frozen", "frozen pipes",
+    "pipe burst", "pipes burst", "burst pipe",
     # Breathing emergency
     "cannot breathe", "can't breathe",
 ]
