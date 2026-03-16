@@ -111,44 +111,6 @@ Any state ─► ESCALATING          (intent=escalate or booking error)
 
 ---
 
-## Directory Structure
-
-```
-apps/
-  orchestrator/
-    routers/
-      voice.py         — Twilio webhooks, WebSocket handler, /simulate endpoint
-    services/
-      llm.py           — GPT-4o-mini intent + slot extraction, regex fast path
-      state_machine.py — Deterministic call flow
-      tools.py         — Booking tools (Supabase direct calls)
-      tts.py           — Deepgram Aura TTS
-      deepgram_stt.py  — Deepgram live STT
-      session_store.py — In-memory session store (keyed by call_sid)
-      supabase_logger.py — Async call/turn logging
-      config.py        — Pydantic settings from .env
-
-  resources/
-    pricing/           — after_hours_fees.json
-    policies/          — emergency_triage.md
-    scripts/           — call_opening.txt, safety_gas_smell.txt
-    service_area/      — gta_cities.json
-    test_client.html   — Browser WebRTC test UI (served at /voice/test-client)
-
-packages/
-  core/
-    models.py          — CallSession, CallState, Intent, LLMTurnResult
-    utils.py           — detect_emergency(), is_gta_city()
-
-sql/
-  schema.sql           — Full schema + seed data
-
-infra/
-  render.yaml          — Render deployment config
-```
-
----
-
 ## The LLM's Role Is Intentionally Narrow
 
 The LLM does one thing: take a caller's raw utterance and return structured JSON — which intent was expressed and what slot values were mentioned. It does not generate the voice responses the caller hears (those are scripted Python strings), it does not decide what to do next (the state machine does), and it does not call any functions (the orchestrator does, only when the state machine reaches `CLOSING`).
