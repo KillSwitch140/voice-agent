@@ -111,44 +111,6 @@ Any state ─► ESCALATING          (intent=escalate or booking error)
 
 ---
 
-## Directory Structure
-
-```
-apps/
-  orchestrator/
-    routers/
-      voice.py         — Twilio webhooks, WebSocket handler, /simulate endpoint
-    services/
-      llm.py           — GPT-4o-mini intent + slot extraction, regex fast path
-      state_machine.py — Deterministic call flow
-      tools.py         — Booking tools (Supabase direct calls)
-      tts.py           — Deepgram Aura TTS
-      deepgram_stt.py  — Deepgram live STT
-      session_store.py — In-memory session store (keyed by call_sid)
-      supabase_logger.py — Async call/turn logging
-      config.py        — Pydantic settings from .env
-
-  resources/
-    pricing/           — after_hours_fees.json
-    policies/          — emergency_triage.md
-    scripts/           — call_opening.txt, safety_gas_smell.txt
-    service_area/      — gta_cities.json
-    test_client.html   — Browser WebRTC test UI (served at /voice/test-client)
-
-packages/
-  core/
-    models.py          — CallSession, CallState, Intent, LLMTurnResult
-    utils.py           — detect_emergency(), is_gta_city()
-
-sql/
-  schema.sql           — Full schema + seed data
-
-infra/
-  render.yaml          — Render deployment config
-```
-
----
-
 ## Core Features
 
 ### Appointment Booking
